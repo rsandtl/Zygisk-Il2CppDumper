@@ -12,6 +12,7 @@
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
+#include <cstdio>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -325,6 +326,139 @@ std::string dump_type(const Il2CppType *type) {
     return outPut.str();
 }
 
+struct MapSeg {
+    uint64_t start;
+    uint64_t end;
+    uint64_t offset;
+    char perms[8];
+    std::string path;
+};
+
+static std::vector<MapSeg> parse_self_maps() {
+    std::vector<MapSeg> segs;
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) {
+        LOGE("open /proc/self/maps failed");
+        return segs;
+    }
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        MapSeg s{};
+        char path[768] = {};
+        if (sscanf(line, "%" SCNx64 "-%" SCNx64 " %7s %" SCNx64 " %*s %*d %767[^\n]",
+                   &s.start, &s.end, s.perms, &s.offset, path) < 4) {
+            continue;
+        }
+        s.path = path;
+        while (!s.path.empty() && s.path.front() == ' ') {
+            s.path.erase(s.path.begin());
+        }
+        segs.push_back(s);
+    }
+    fclose(fp);
+    return segs;
+}
+
+static bool write_mem_to_file(const char *outPath, uint64_t start, uint64_t size) {
+    FILE *out = fopen(outPath, "wb");
+    if (!out) {
+        LOGE("open %s failed", outPath);
+        return false;
+    }
+    const size_t wrote = fwrite(reinterpret_cast<const void *>(start), 1, (size_t) size, out);
+    fclose(out);
+    LOGI("wrote %s size=%zu", outPath, wrote);
+    return wrote == (size_t) size;
+}
+
+static void dump_so_from_maps(const char *outDir, const std::vector<MapSeg> &segs) {
+    uint64_t first_start = 0;
+    uint64_t max_end_off = 0;
+    std::vector<const MapSeg *> so_segs;
+    for (const auto &s : segs) {
+        if (s.path.find("libil2cpp.so") == std::string::npos) {
+            continue;
+        }
+        LOGI("il2cpp map %s %" PRIx64 "-%" PRIx64 " off=%" PRIx64,
+             s.perms, s.start, s.end, s.offset);
+        if (!first_start) {
+            first_start = s.start;
+        }
+        const bool bss_like = (s.offset == 0 && s.start != first_start);
+        if (bss_like) {
+            continue;
+        }
+        so_segs.push_back(&s);
+        const uint64_t end_off = s.offset + (s.end - s.start);
+        if (end_off > max_end_off) {
+            max_end_off = end_off;
+        }
+    }
+    if (so_segs.empty() || max_end_off == 0) {
+        LOGE("no libil2cpp.so file-backed maps");
+        return;
+    }
+    auto outPath = std::string(outDir) + "/files/libil2cpp_mem.so";
+    FILE *out = fopen(outPath.c_str(), "wb");
+    if (!out) {
+        LOGE("open %s failed", outPath.c_str());
+        return;
+    }
+    if (ftruncate(fileno(out), (off_t) max_end_off) != 0) {
+        LOGW("ftruncate libil2cpp_mem.so to %" PRIu64 " failed", max_end_off);
+    }
+    for (auto *s : so_segs) {
+        if (fseeko(out, (off_t) s->offset, SEEK_SET) != 0) {
+            LOGE("fseeko off=%" PRIx64 " failed", s->offset);
+            continue;
+        }
+        const size_t n = (size_t) (s->end - s->start);
+        const size_t wrote = fwrite(reinterpret_cast<const void *>(s->start), 1, n, out);
+        LOGI("so dump off=%" PRIx64 " mem=%" PRIx64 " size=%zu wrote=%zu",
+             s->offset, s->start, n, wrote);
+    }
+    fclose(out);
+    LOGI("libil2cpp_mem.so done, file_size=%" PRIu64, max_end_off);
+}
+
+static void dump_metadata_from_maps(const char *outDir, const std::vector<MapSeg> &segs) {
+    constexpr uint32_t kMetaMagic = 0xFAB11BAF;
+    int idx = 0;
+    for (const auto &s : segs) {
+        if (s.perms[0] != 'r') {
+            continue;
+        }
+        const uint64_t size = s.end - s.start;
+        const bool named = s.path.find("global-metadata") != std::string::npos
+                           || s.path.find("Metadata") != std::string::npos;
+        const bool anon_candidate = s.path.empty()
+                                    || s.path[0] == '['
+                                    || s.path.find("anon") != std::string::npos;
+        if (!named && !(anon_candidate && size >= (1u << 20) && size <= (80u << 20))) {
+            continue;
+        }
+        auto *p = reinterpret_cast<const uint32_t *>(s.start);
+        if (*p != kMetaMagic) {
+            continue;
+        }
+        LOGI("metadata magic at %" PRIx64 " size=%" PRIx64 " path=%s",
+             s.start, size, s.path.c_str());
+        char name[64];
+        snprintf(name, sizeof(name), "/files/global-metadata_%d.dat", idx++);
+        write_mem_to_file((std::string(outDir) + name).c_str(), s.start, size);
+    }
+    if (idx == 0) {
+        LOGW("global-metadata.dat not found in maps (magic 0xFAB11BAF)");
+    }
+}
+
+void dump_runtime_binaries(const char *outDir) {
+    LOGI("dump runtime binaries to %s/files/", outDir);
+    auto segs = parse_self_maps();
+    dump_so_from_maps(outDir, segs);
+    dump_metadata_from_maps(outDir, segs);
+}
+
 static bool il2cpp_dump_apis_ready() {
     return il2cpp_domain_get
            && il2cpp_domain_get_assemblies
@@ -376,6 +510,7 @@ void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
     if (!il2cpp_dump_apis_ready()) {
         LOGE("skip dump: required il2cpp APIs are null");
+        dump_runtime_binaries(outDir);
         return;
     }
     size_t size;
