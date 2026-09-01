@@ -26,11 +26,14 @@
 static uint64_t il2cpp_base = 0;
 
 void init_il2cpp_api(void *handle) {
-#define DO_API(r, n, p) {                      \
-    n = (r (*) p)xdl_sym(handle, #n, nullptr); \
-    if(!n) {                                   \
-        LOGW("api not found %s", #n);          \
-    }                                          \
+#define DO_API(r, n, p) {                                      \
+    n = (r (*) p)xdl_sym(handle, #n, nullptr);                 \
+    if (!n) {                                                  \
+        n = (r (*) p)xdl_dsym(handle, #n, nullptr);            \
+    }                                                          \
+    if (!n) {                                                  \
+        LOGW("api not found %s", #n);                          \
+    }                                                          \
 }
 
 #include "il2cpp-api-functions.h"
@@ -322,6 +325,18 @@ std::string dump_type(const Il2CppType *type) {
     return outPut.str();
 }
 
+static bool il2cpp_dump_apis_ready() {
+    return il2cpp_domain_get
+           && il2cpp_domain_get_assemblies
+           && il2cpp_assembly_get_image
+           && il2cpp_image_get_name
+           && il2cpp_class_get_type
+           && ((il2cpp_image_get_class && il2cpp_image_get_class_count)
+               || (il2cpp_get_corlib && il2cpp_class_from_name
+                   && il2cpp_class_get_method_from_name && il2cpp_class_from_system_type
+                   && il2cpp_string_new));
+}
+
 void il2cpp_api_init(void *handle) {
     LOGI("il2cpp_handle: %p", handle);
     init_il2cpp_api(handle);
@@ -335,16 +350,34 @@ void il2cpp_api_init(void *handle) {
         LOGE("Failed to initialize il2cpp api.");
         return;
     }
+    if (!il2cpp_is_vm_thread) {
+        LOGE("il2cpp_is_vm_thread missing, skip dump");
+        return;
+    }
     while (!il2cpp_is_vm_thread(nullptr)) {
         LOGI("Waiting for il2cpp_init...");
         sleep(1);
     }
+    // 易盾可能在 init 之后才把剩余导出填回去，再解析一次
+    init_il2cpp_api(handle);
+    if (!il2cpp_dump_apis_ready()) {
+        LOGE("il2cpp dump APIs still missing after init (packed/stripped so), skip dump");
+        return;
+    }
     auto domain = il2cpp_domain_get();
+    if (!domain || !il2cpp_thread_attach) {
+        LOGE("il2cpp domain/thread_attach missing, skip dump");
+        return;
+    }
     il2cpp_thread_attach(domain);
 }
 
 void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
+    if (!il2cpp_dump_apis_ready()) {
+        LOGE("skip dump: required il2cpp APIs are null");
+        return;
+    }
     size_t size;
     auto domain = il2cpp_domain_get();
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
