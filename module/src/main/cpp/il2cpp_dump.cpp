@@ -371,54 +371,165 @@ static bool write_mem_to_file(const char *outPath, uint64_t start, uint64_t size
     return wrote == (size_t) size;
 }
 
-static void dump_so_from_maps(const char *outDir, const std::vector<MapSeg> &segs) {
-    uint64_t first_start = 0;
-    uint64_t max_end_off = 0;
-    std::vector<const MapSeg *> so_segs;
+static bool is_il2cpp_map(const MapSeg &s) {
+    return s.path.find("libil2cpp.so") != std::string::npos;
+}
+
+static void restore_elf_header_from_disk(FILE *out, const std::string &soPath) {
+    if (soPath.empty() || soPath[0] != '/') {
+        return;
+    }
+    FILE *disk = fopen(soPath.c_str(), "rb");
+    if (!disk) {
+        LOGW("open disk so failed: %s", soPath.c_str());
+        return;
+    }
+    unsigned char hdr[512];
+    const size_t n = fread(hdr, 1, sizeof(hdr), disk);
+    fclose(disk);
+    if (n < 64 || hdr[0] != 0x7F || hdr[1] != 0x45 || hdr[2] != 0x4C || hdr[3] != 0x46) {
+        LOGW("disk so has no ELF header");
+        return;
+    }
+    if (fseeko(out, 0, SEEK_SET) != 0) {
+        return;
+    }
+    fwrite(hdr, 1, n, out);
+    LOGI("restored ELF header %zu bytes from %s", n, soPath.c_str());
+}
+
+static void collect_il2cpp_va_segs(const std::vector<MapSeg> &segs,
+                                  std::vector<const MapSeg *> *out_segs,
+                                  uint64_t *out_base,
+                                  uint64_t *out_last,
+                                  std::string *out_disk_path) {
+    uint64_t named_min = 0;
+    uint64_t named_max = 0;
+    std::string disk_path;
     for (const auto &s : segs) {
-        if (s.path.find("libil2cpp.so") == std::string::npos) {
+        if (!is_il2cpp_map(s)) {
             continue;
         }
         LOGI("il2cpp map %s %" PRIx64 "-%" PRIx64 " off=%" PRIx64,
              s.perms, s.start, s.end, s.offset);
-        if (!first_start) {
-            first_start = s.start;
+        if (!named_min || s.start < named_min) {
+            named_min = s.start;
         }
-        const bool bss_like = (s.offset == 0 && s.start != first_start);
-        if (bss_like) {
-            continue;
+        if (s.end > named_max) {
+            named_max = s.end;
         }
-        so_segs.push_back(&s);
-        const uint64_t end_off = s.offset + (s.end - s.start);
-        if (end_off > max_end_off) {
-            max_end_off = end_off;
+        if (disk_path.empty() && s.offset == 0 && s.path[0] == '/') {
+            disk_path = s.path;
         }
     }
-    if (so_segs.empty() || max_end_off == 0) {
-        LOGE("no libil2cpp.so file-backed maps");
+    if (!named_min) {
         return;
     }
-    auto outPath = std::string(outDir) + "/files/libil2cpp_mem.so";
-    FILE *out = fopen(outPath.c_str(), "wb");
+    for (const auto &s : segs) {
+        if (s.perms[0] != 'r') {
+            continue;
+        }
+        if (s.end <= named_min || s.start >= named_max) {
+            continue;
+        }
+        if (!is_il2cpp_map(s) && !s.path.empty() && s.path[0] != '[') {
+            continue;
+        }
+        out_segs->push_back(&s);
+        if (s.end > named_max && is_il2cpp_map(s)) {
+            named_max = s.end;
+        }
+    }
+    *out_base = named_min;
+    *out_last = named_max;
+    *out_disk_path = disk_path;
+}
+
+static void scan_il2cpp_registrations(const std::vector<const MapSeg *> &segs, uint64_t base) {
+    constexpr uint64_t kTypes = 53197;
+    constexpr uint64_t kImages = 146;
+    auto readable = [&](uint64_t va, uint64_t bytes) -> bool {
+        for (auto *s : segs) {
+            if (va >= s->start && va + bytes <= s->end) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (auto *s : segs) {
+        if ((s->start & 7) != 0) {
+            continue;
+        }
+        const auto *p = reinterpret_cast<const uint64_t *>(s->start);
+        const size_t n = (size_t) ((s->end - s->start) / 8);
+        for (size_t i = 0; i + 3 < n; ++i) {
+            if (p[i] == kTypes && p[i + 2] == kTypes) {
+                const uint64_t count_va = s->start + i * 8;
+                const uint64_t mr_va = count_va - 80;
+                LOGI("MetadataRegistration cand va=%" PRIx64 " rva=%" PRIx64,
+                     mr_va, mr_va - base);
+            }
+            if (p[i] == kImages && readable(p[i + 1], 16)) {
+                const uint64_t mods = p[i + 1];
+                const auto *arr = reinterpret_cast<const uint64_t *>(mods);
+                if (readable(arr[0], 16)) {
+                    const auto *mod = reinterpret_cast<const uint64_t *>(arr[0]);
+                    const auto name_va = mod[0];
+                    if (readable(name_va, 8)) {
+                        const auto *name = reinterpret_cast<const char *>(name_va);
+                        if (strstr(name, ".dll") || strstr(name, "__Generated")) {
+                            const uint64_t count_va = s->start + i * 8;
+                            LOGI("CodeRegistration cand name=%s count_va=%" PRIx64
+                                 " CR13_rva=%" PRIx64 " CR14_rva=%" PRIx64,
+                                 name, count_va,
+                                 count_va - base - 13 * 8,
+                                 count_va - base - 14 * 8);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void dump_so_from_maps(const char *outDir, const std::vector<MapSeg> &segs) {
+    std::vector<const MapSeg *> va_segs;
+    uint64_t base = 0;
+    uint64_t last = 0;
+    std::string disk_path;
+    collect_il2cpp_va_segs(segs, &va_segs, &base, &last, &disk_path);
+    if (va_segs.empty() || last <= base) {
+        LOGE("no libil2cpp.so maps");
+        return;
+    }
+    const uint64_t va_size = last - base;
+    LOGI("il2cpp dump address (use this in Il2CppDumper): 0x%" PRIx64, base);
+    LOGI("libil2cpp_va.so span %" PRIx64 "-%" PRIx64 " size=%" PRIu64, base, last, va_size);
+
+    auto vaPath = std::string(outDir) + "/files/libil2cpp_va.so";
+    FILE *out = fopen(vaPath.c_str(), "wb");
     if (!out) {
-        LOGE("open %s failed", outPath.c_str());
+        LOGE("open %s failed", vaPath.c_str());
         return;
     }
-    if (ftruncate(fileno(out), (off_t) max_end_off) != 0) {
-        LOGW("ftruncate libil2cpp_mem.so to %" PRIu64 " failed", max_end_off);
+    if (ftruncate(fileno(out), (off_t) va_size) != 0) {
+        LOGW("ftruncate libil2cpp_va.so to %" PRIu64 " failed", va_size);
     }
-    for (auto *s : so_segs) {
-        if (fseeko(out, (off_t) s->offset, SEEK_SET) != 0) {
-            LOGE("fseeko off=%" PRIx64 " failed", s->offset);
+    for (auto *s : va_segs) {
+        const uint64_t off = s->start - base;
+        const size_t n = (size_t) (s->end - s->start);
+        if (fseeko(out, (off_t) off, SEEK_SET) != 0) {
+            LOGE("fseeko va-off=%" PRIx64 " failed", off);
             continue;
         }
-        const size_t n = (size_t) (s->end - s->start);
         const size_t wrote = fwrite(reinterpret_cast<const void *>(s->start), 1, n, out);
-        LOGI("so dump off=%" PRIx64 " mem=%" PRIx64 " size=%zu wrote=%zu",
-             s->offset, s->start, n, wrote);
+        LOGI("va dump mem=%" PRIx64 "-%" PRIx64 " file_off=%" PRIx64 " wrote=%zu %s",
+             s->start, s->end, off, wrote, s->path.c_str());
     }
+    restore_elf_header_from_disk(out, disk_path);
     fclose(out);
-    LOGI("libil2cpp_mem.so done, file_size=%" PRIu64, max_end_off);
+    LOGI("libil2cpp_va.so done, dump_address=0x%" PRIx64 " file_size=%" PRIu64, base, va_size);
+    scan_il2cpp_registrations(va_segs, base);
 }
 
 static void dump_metadata_from_maps(const char *outDir, const std::vector<MapSeg> &segs) {
